@@ -1,13 +1,17 @@
-.PHONY: help lint typecheck build test check format fix clean hooks docs serve-docs fuzz fuzz-host fuzz-cbor fuzz-protocol fuzz-sandbox fuzz-cbor-last fuzz-protocol-last fuzz-sandbox-last fuzz-cbor-repro fuzz-protocol-repro fuzz-sandbox-repro fuzz-clean libkrun krun-runner
+.PHONY: help lint typecheck build test check format fix clean hooks docs serve-docs fuzz fuzz-host fuzz-cbor fuzz-protocol fuzz-sandbox fuzz-cbor-last fuzz-protocol-last fuzz-sandbox-last fuzz-cbor-repro fuzz-protocol-repro fuzz-sandbox-repro fuzz-clean libkrun krun-runner native native-check native-test native-release native-test-linux native-test-docker native-test-kvm native-fuzz
 
 RUN_PARALLEL ?= ./scripts/run-parallel
 
-LIBKRUN_VERSION ?= v1.17.4
+LIBKRUN_VERSION ?= v1.19.8
 LIBKRUN_FULL_VERSION ?= $(patsubst v%,%,$(LIBKRUN_VERSION))
 LIBKRUN_REPO ?= https://github.com/containers/libkrun.git
 LIBKRUN_SRC_DIR ?= .cache/libkrun-$(LIBKRUN_VERSION)
 LIBKRUN_BUILD_FLAGS ?= BLK=1 NET=1
 LIBKRUN_PREFIX ?= $(CURDIR)/.cache/libkrun-install/$(LIBKRUN_VERSION)
+# gondolin's patches on top of the libkrun release (applied in order; the
+# checkout is reset and re-patched when they change)
+LIBKRUN_PATCHES := $(sort $(wildcard host/krun-runner/patches/*.patch))
+LIBKRUN_PATCH_STAMP := $(shell cat $(LIBKRUN_PATCHES) /dev/null | cksum | cut -d' ' -f1)
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -19,6 +23,12 @@ LIBKRUN_TARGET_ARCH := x86_64
 else
 LIBKRUN_TARGET_ARCH := $(UNAME_M)
 endif
+
+# oldest glibc the Linux krun runner runs on: zig would otherwise target the
+# build host's glibc (2.39 on ubuntu-latest), and its std then uses
+# arc4random_buf (glibc 2.36), which Amazon Linux 2023 and RHEL 9 (2.34) lack;
+# libkrun itself needs 2.34
+KRUN_RUNNER_GLIBC ?= 2.34
 
 ifeq ($(UNAME_S),Darwin)
 BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
@@ -35,7 +45,7 @@ endif
 
 help:
 	@echo "Available commands:"
-	@echo "  make build       - Build guest + host"
+	@echo "  make build       - Build guest + host + native"
 	@echo "  make lint        - Run linters"
 	@echo "  make typecheck   - Run type checks"
 	@echo "  make check       - Run lint + typecheck"
@@ -55,21 +65,31 @@ help:
 	@echo "  make fuzz-protocol-repro [FILE=path] - Run protocol repro in VM (defaults to newest)"
 	@echo "  make fuzz-sandbox-repro [FILE=path] - Run sandbox repro in VM (defaults to newest)"
 	@echo "  make fuzz-clean  - Remove fuzz binaries + cache"
-	@echo "  make docs        - Build documentation site (Zensical)"
-	@echo "  make serve-docs  - Serve documentation locally (Zensical)"
+	@echo "  make docs        - Build documentation site (docs/ -> site/)"
+	@echo "  make serve-docs  - Serve documentation locally, rebuilding on change"
 	@echo "  make hooks       - Install git hooks"
 	@echo "  make libkrun     - Build + stage libkrun locally under .cache/"
 	@echo "  make krun-runner - Build libkrun + host/krun-runner helper"
+	@echo "  make native      - Build the native engine workspace (native/)"
+	@echo "  make native-check - cargo fmt --check + clippy + dependency budget for native/"
+	@echo "  make native-test - Run native/ tests on this machine"
+	@echo "  make native-release - Static release binaries for linux-musl + darwin (native/target/dist)"
+	@echo "  make native-test-linux - Run native/ tests cross-compiled for Linux inside a VM"
+	@echo "  make native-test-docker - Linux tests in Docker (cargo arm64/amd64, native engine VMs under TCG, host tests)"
+	@echo "  make native-test-kvm - Linux tests with KVM in a Lima VM (nested virtualization; SUITES=...)"
+	@echo "  make native-fuzz - Run the native/ cargo-fuzz targets (nightly; FUZZ_TIME, FUZZ_TARGETS)"
 
 build:
-	@$(RUN_PARALLEL) -j 2 \
+	@$(RUN_PARALLEL) -j 3 \
 		"guest:build" "$(MAKE) -C guest build" \
-		"host:build" "$(MAKE) -C host build"
+		"host:build" "$(MAKE) -C host build" \
+		"native:build" "$(MAKE) -C native build"
 
 lint:
-	@$(RUN_PARALLEL) -j 2 \
+	@$(RUN_PARALLEL) -j 3 \
 		"guest:lint" "$(MAKE) -C guest lint" \
-		"host:lint" "$(MAKE) -C host lint"
+		"host:lint" "$(MAKE) -C host lint" \
+		"native:lint" "$(MAKE) -C native check"
 
 typecheck:
 	@$(RUN_PARALLEL) -j 2 \
@@ -81,23 +101,27 @@ check:
 		"guest:lint" "$(MAKE) -C guest lint" \
 		"guest:typecheck" "$(MAKE) -C guest typecheck" \
 		"host:lint" "$(MAKE) -C host lint" \
-		"host:typecheck" "$(MAKE) -C host typecheck"
+		"host:typecheck" "$(MAKE) -C host typecheck" \
+		"native:check" "$(MAKE) -C native check"
 
 test:
 	@$(MAKE) -C guest test
+	@$(MAKE) -C native test
 	@$(MAKE) -C host test
 
 format:
-	@$(RUN_PARALLEL) -j 2 \
+	@$(RUN_PARALLEL) -j 3 \
 		"guest:format" "$(MAKE) -C guest format" \
-		"host:format" "$(MAKE) -C host format"
+		"host:format" "$(MAKE) -C host format" \
+		"native:format" "$(MAKE) -C native format"
 
 fix: format
 
 clean:
-	@$(RUN_PARALLEL) -j 2 \
+	@$(RUN_PARALLEL) -j 3 \
 		"guest:clean" "$(MAKE) -C guest clean" \
-		"host:clean" "$(MAKE) -C host clean"
+		"host:clean" "$(MAKE) -C host clean" \
+		"native:clean" "$(MAKE) -C native clean"
 
 hooks:
 	@git config core.hooksPath .husky
@@ -117,6 +141,15 @@ libkrun:
 	@if [ ! -d "$(LIBKRUN_SRC_DIR)/.git" ]; then \
 		echo "Cloning libkrun $(LIBKRUN_VERSION) into $(LIBKRUN_SRC_DIR)"; \
 		git clone --depth 1 --branch "$(LIBKRUN_VERSION)" "$(LIBKRUN_REPO)" "$(LIBKRUN_SRC_DIR)"; \
+	fi
+	@stamp="$(LIBKRUN_SRC_DIR)/.git/gondolin-patches"; \
+	if [ "$$(cat "$$stamp" 2>/dev/null)" != "$(LIBKRUN_PATCH_STAMP)" ]; then \
+		echo "Applying gondolin patches to libkrun"; \
+		git -C "$(LIBKRUN_SRC_DIR)" checkout -q -- . && git -C "$(LIBKRUN_SRC_DIR)" clean -fdq -- src include || exit 1; \
+		for p in $(LIBKRUN_PATCHES); do \
+			echo "  $$p"; git -C "$(LIBKRUN_SRC_DIR)" apply "$(CURDIR)/$$p" || exit 1; \
+		done; \
+		echo "$(LIBKRUN_PATCH_STAMP)" > "$$stamp"; \
 	fi
 	@echo "Building libkrun ($(LIBKRUN_BUILD_FLAGS))"
 	@env $(LIBKRUN_BUILD_ENV) $(MAKE) -C "$(LIBKRUN_SRC_DIR)" $(LIBKRUN_MAKE_ARGS)
@@ -152,8 +185,11 @@ krun-runner: libkrun
 			PKG_CONFIG_LIBDIR="$(LIBKRUN_PREFIX)/lib64/pkgconfig:$(LIBKRUN_PREFIX)/lib/pkgconfig" \
 			C_INCLUDE_PATH="$(LIBKRUN_PREFIX)/include:$$C_INCLUDE_PATH" \
 			LIBRARY_PATH="$(LIBKRUN_PREFIX)/lib64:$(LIBKRUN_PREFIX)/lib:$$LIBRARY_PATH" \
-			zig build -Doptimize=ReleaseSafe -Dlibkrun-prefix="$(LIBKRUN_PREFIX)"; \
+			zig build -Doptimize=ReleaseSafe \
+				-Dtarget=$(LIBKRUN_TARGET_ARCH)-linux-gnu.$(KRUN_RUNNER_GLIBC) \
+				-Dlibkrun-prefix="$(LIBKRUN_PREFIX)"; \
 		fi
+	@rm -rf host/krun-runner/zig-out/lib
 	@mkdir -p host/krun-runner/zig-out/lib
 	@set -eu; \
 		copied=0; \
@@ -179,20 +215,19 @@ krun-runner: libkrun
 	@echo "Bundled libs: host/krun-runner/zig-out/lib/libkrun*"
 	@echo "Run with: GONDOLIN_VMM=krun GONDOLIN_KRUN_RUNNER=$$(pwd)/host/krun-runner/zig-out/bin/gondolin-krun-runner npx @earendil-works/gondolin bash"
 
-ZENSICAL_VERSION ?= 0.0.21
-
+# Build documentation site (docs/ -> site/)
 docs:
-	@uvx --from "zensical==$(ZENSICAL_VERSION)" zensical build
-	@touch site/.nojekyll
+	@uv run --script scripts/docs/build.py build
 
+# Serve documentation locally, rebuilding on change
 serve-docs:
-	@uvx --from "zensical==$(ZENSICAL_VERSION)" zensical serve
+	@uv run --script scripts/docs/build.py serve
 
 fuzz:
 	@$(MAKE) -C guest fuzz
 
 # Host-side fuzzing
-HOST_FUZZ_TARGET ?= virtio
+HOST_FUZZ_TARGET ?= tar
 fuzz-host:
 	@$(MAKE) -C host fuzz TARGET="$(HOST_FUZZ_TARGET)"
 
@@ -225,3 +260,27 @@ fuzz-sandbox-repro:
 
 fuzz-clean:
 	@$(MAKE) -C guest fuzz-clean
+
+native:
+	@$(MAKE) -C native build
+
+native-check:
+	@$(MAKE) -C native check
+
+native-test:
+	@$(MAKE) -C native test
+
+native-release:
+	@$(MAKE) -C native dist
+
+native-test-linux:
+	@$(MAKE) -C native test-linux
+
+native-test-docker:
+	@$(MAKE) -C native test-docker
+
+native-test-kvm:
+	@native/scripts/linux-kvm-vm.sh test $(SUITES)
+
+native-fuzz:
+	@$(MAKE) -C native fuzz

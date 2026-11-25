@@ -46,6 +46,70 @@ jobs:
       - name: Verify packaged CLI runtime
         run: node host/dist/bin/gondolin.js --help >/dev/null
 
+  native:
+    name: Native engine (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Check (rustfmt + clippy -D warnings)
+        run: make -C native check
+
+      # qemu-img/qemu-io for the gondolin-qcow2 interop tests (tests/qemu.rs)
+      - name: Install qemu-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+
+      - name: Test workspace
+        working-directory: native
+        env:
+          # fail instead of skipping the qemu-img interop tests
+          GONDOLIN_REQUIRE_QEMU_IMG: "1"
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries (gondolind + static gondolin CLI)
+        working-directory: native
+        run: cargo build --release --locked -p gondolind -p gondolin-cli
+
+      - name: Verify binaries
+        run: |
+          native/target/release/gondolind --version
+          native/target/release/gondolin --version
+
+      - name: Upload native binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: gondolin-native-linux-x64
+          path: |
+            native/target/release/gondolind
+            native/target/release/gondolin
+          retention-days: 7
+
+  native-deps:
+    name: Native dependency budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # runtime crates of the gondolin binary per release target
+      # (native/scripts/count-deps.sh, budget in native/deps-budget)
+      - name: Count runtime crates
+        run: make -C native deps
+
   build-guest:
     name: Build Guest (${{ matrix.arch }})
     runs-on: ubuntu-latest
@@ -81,7 +145,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.qemu }} lz4
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           pnpm install
 
       - name: Build guest binaries (cross-compile)
@@ -244,6 +308,20 @@ jobs:
           node scripts/prepare-krun-runner-package.mjs \
             --package packages/gondolin-krun-runner-linux-x64
 
+      # the published runner must keep working on glibc 2.34 (Amazon Linux
+      # 2023, RHEL 9): see KRUN_RUNNER_GLIBC in the Makefile
+      - name: Check the runner's glibc floor
+        run: |
+          set -eu
+          for f in packages/gondolin-krun-runner-linux-x64/bin/gondolin-krun-runner \
+                   packages/gondolin-krun-runner-linux-x64/lib/libkrun.so.*.*; do
+            need=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "$f: glibc $need"
+            if [ "$(printf '%s\n2.34\n' "$need" | sort -V | tail -1)" != 2.34 ]; then
+              echo "::error::$f needs glibc $need (> 2.34)"; exit 1
+            fi
+          done
+
       - name: Smoke test packed linux runner package
         run: |
           PKG_DIR="packages/gondolin-krun-runner-linux-x64"
@@ -299,7 +377,7 @@ jobs:
             libclang-dev llvm-dev libcap-ng-dev
 
       - name: Enable KVM
-        run: sudo chown $(id -u) /dev/kvm
+        run: sudo chown "$(id -u)" /dev/kvm
 
       - name: Install dependencies
         run: pnpm install
@@ -307,10 +385,21 @@ jobs:
       - name: Build krun runner
         run: make krun-runner
 
+      # the SDK runs VMs of both backends through gondolind; built here
+      # rather than taken from the native job so this job does not depend
+      # on that job's lint and dependency checks
+      - name: Build gondolind
+        working-directory: native
+        run: |
+          cargo build --release --locked -p gondolind
+          echo "GONDOLIN_NATIVE_BIN=$PWD/target/release/gondolind" >> "$GITHUB_ENV"
+
+      # x86_64 krun must work here (the runner has /dev/kvm): a failed probe
+      # fails the job instead of letting the krun tests skip themselves
       - name: Probe krun runtime availability
         run: |
           cd host
-          node --input-type=module -e "import { getKrunRuntimeSkipReason } from './test/helpers/vm-fixture.ts'; const reason = await getKrunRuntimeSkipReason(); if (reason) { console.log('krun precheck: unavailable ->', reason); } else { console.log('krun precheck: available'); }"
+          node --input-type=module -e "import { getKrunRuntimeSkipReason } from './test/helpers/vm-fixture.ts'; const reason = await getKrunRuntimeSkipReason(); if (reason) { console.log('krun precheck: unavailable ->', reason); process.exit(1); } else { console.log('krun precheck: available'); }"
         env:
           GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
 
@@ -322,13 +411,17 @@ jobs:
         env:
           GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
           WS_TIMEOUT: "120000"
-          # krun runtime is best-effort on shared CI runners; tests self-skip when precheck fails
-          GONDOLIN_REQUIRE_KRUN: "0"
+          GONDOLIN_REQUIRE_KRUN: "1"
 
   test:
     name: Test
-    needs: [check, build-guest]
+    needs: [check, build-guest, native]
     runs-on: ubuntu-latest
+    env:
+      # krun is the default where a runner is installed (the npm runner
+      # package is), but it is best-effort on shared runners and this job
+      # covers the QEMU paths (virtio-fs, sandboxfs); see backend-parity
+      GONDOLIN_VMM: qemu
     steps:
       - uses: actions/checkout@v7
 
@@ -358,15 +451,29 @@ jobs:
       - name: Install Zig
         run: scripts/install-zig.sh 0.17.0
 
+      - name: Download native binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: gondolin-native-linux-x64
+          path: native-bin
+
+      - name: Install native binaries
+        run: |
+          chmod +x native-bin/gondolind native-bin/gondolin
+          echo "GONDOLIN_NATIVE_BIN=$PWD/native-bin/gondolind" >> "$GITHUB_ENV"
+          echo "GONDOLIN_CLI_BIN=$PWD/native-bin/gondolin" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
+        # Ubuntu's QEMU has vhost-user-fs and memory-backend-memfd, so the
+        # guest filesystem runs over virtio-fs here.
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 lz4
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Enable KVM
-        run: sudo chown $(id -u) /dev/kvm
+        run: sudo chown "$(id -u)" /dev/kvm
 
       - name: Install dependencies
         run: pnpm install
@@ -374,19 +481,36 @@ jobs:
       - name: Build
         run: pnpm run build
 
-      - name: Run tests
-        # Run guest + host tests sequentially to avoid running multiple QEMU instances
-        # concurrently (which can hang/time out on some CI runners).
-        timeout-minutes: 20
-        run: |
-          NODE_BIN="$(node -p 'process.execPath')"
-          make -C guest test NODE="$NODE_BIN"
-          make -C host test NODE="$NODE_BIN"
+      - name: Run guest tests
+        timeout-minutes: 10
+        run: make -C guest test NODE="$(node -p 'process.execPath')"
+        env:
+          GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
+
+      - name: Check the guest mounts the VFS over virtio-fs
+        timeout-minutes: 5
+        working-directory: host
+        run: node scripts/check-virtiofs.ts
+        env:
+          GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
+          GONDOLIN_VIRTIOFS: "1"
+
+      - name: Run host tests (virtio-fs)
+        timeout-minutes: 25
+        run: make -C host test NODE="$(node -p 'process.execPath')"
         env:
           GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
           WS_TIMEOUT: "120000"
-          # Enable VM/QEMU logs to help diagnose boot/hang issues in CI.
-          GONDOLIN_DEBUG: "net"
+
+      - name: Run native VFS tests over sandboxfs
+        # the fallback transport (krun, QEMU without vhost-user)
+        timeout-minutes: 10
+        working-directory: host
+        run: node --test test/vfs.test.ts test/native-vfs.test.ts test/vfs-many-mounts.test.ts
+        env:
+          GONDOLIN_VIRTIOFS: "0"
+          GONDOLIN_GUEST_DIR: ${{ github.workspace }}/guest/image/out
+          WS_TIMEOUT: "120000"
 
   # Optional: Publish preview package for PRs (uses trusted publishing)
   # Uncomment to enable publishing test versions from PRs

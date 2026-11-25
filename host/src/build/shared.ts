@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFileSync, spawn, type SpawnOptions } from "node:child_process";
 
 import {
+  GUEST_IMAGE_FEATURES,
   MANIFEST_FILENAME,
   computeAssetBuildId,
   type AssetManifest,
@@ -31,7 +32,6 @@ const BUILD_SANDBOX_HELPERS_FROM_SOURCE_ENV =
 
 export const DEFAULT_ROOTFS_PACKAGES = [
   "linux-virt",
-  "rng-tools",
   "bash",
   "ca-certificates",
   "ca-certificates-bundle",
@@ -536,6 +536,7 @@ export function writeAssetManifest(
     buildId: computeAssetBuildId({ checksums, arch: config.arch }),
     config,
     buildTime: new Date().toISOString(),
+    features: [...GUEST_IMAGE_FEATURES],
     assets,
     checksums,
   };

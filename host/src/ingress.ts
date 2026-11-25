@@ -8,7 +8,7 @@ import type net from "node:net";
 import type { Duplex, Writable } from "node:stream";
 
 import type { VirtualProvider } from "./vfs/node/index.ts";
-import type { SandboxServer } from "./sandbox/server.ts";
+import type { NativeSandboxServer } from "./native/server.ts";
 import {
   isWebSocketUpgradeRequestHeaders,
   MAX_HTTP_HEADER_BYTES,
@@ -871,6 +871,9 @@ export type IngressAccess = {
   close(): Promise<void>;
 };
 
+/** What the ingress gateway needs from a sandbox server */
+export type IngressSandbox = Pick<NativeSandboxServer, "openIngressStream">;
+
 export class IngressGateway {
   private server: http.Server | null = null;
   private hooks: IngressGatewayHooks | null;
@@ -879,11 +882,11 @@ export class IngressGateway {
   private maxBufferedResponseBodyBytes: number;
   private upstreamHeaderTimeoutMs: number;
   private upstreamResponseTimeoutMs: number;
-  private readonly sandbox: SandboxServer;
+  private readonly sandbox: IngressSandbox;
   private readonly listeners: GondolinListeners;
 
   constructor(
-    sandbox: SandboxServer,
+    sandbox: IngressSandbox,
     listeners: GondolinListeners,
     options: Pick<
       EnableIngressOptions,

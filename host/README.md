@@ -2,49 +2,31 @@
 
 **Local Linux micro-VMs with a fully programmable network stack and filesystem.**
 
-Gondolin runs lightweight micro-VMs on your Mac or Linux machine (QEMU by
-default, optional `krun` backend). The network stack and virtual filesystem are
-implemented in TypeScript, giving you complete programmatic control over what
-the sandbox can access and what secrets it can use.
+Gondolin runs lightweight micro-VMs on your Mac or Linux machine (`krun`
+where available, QEMU otherwise). Every guest network connection and file
+access goes through the host, and this TypeScript SDK gives you complete
+programmatic control over what the sandbox can access and what secrets it can
+use.
 
 ## Requirements
 
-You need QEMU installed to run the micro-VMs (default backend):
+- Node.js >= 22.19.0
+- QEMU only where libkrun cannot run the VM (Intel Macs, Linux arm64, Linux
+  without `/dev/kvm`) or when you select the `qemu` backend:
 
-| macOS               | Linux (Debian/Ubuntu)              |
-| ------------------- | ---------------------------------- |
-| `brew install qemu` | `sudo apt install qemu-system-arm` |
+| macOS               | Linux (Debian/Ubuntu)                                                    |
+| ------------------- | ------------------------------------------------------------------------ |
+| `brew install qemu` | `sudo apt install qemu-system-arm` (arm64) or `qemu-system-x86` (x86_64) |
 
-Optional experimental backend:
-
-- `libkrun` + `host/krun-runner` (`sandbox.vmm = "krun"`)
-- `make krun-runner` from repo root stages dependencies locally and builds the runner
-  - on macOS, it also ad-hoc signs the runner with `com.apple.security.hypervisor`
-  - Gondolin auto-detects this local runner for `--vmm krun`
-- `@earendil-works/gondolin` publishes platform-specific optional runner packages for supported targets (`darwin-arm64`, `linux-x64`)
-- krun boot assets are provided by image manifests (`assets.krunKernel` / `assets.krunInitrd`) produced by `gondolin build` and published image releases
-- `gondolin bash --vmm krun` selects the backend per-command
-- `GONDOLIN_VMM=krun` still works as a global default
-- backend parity matrix: [docs/backends.md](../docs/backends.md)
-
-Linux prerequisites for `make krun-runner` (Ubuntu/Debian):
-
-```bash
-sudo apt install \
-  build-essential curl git make pkg-config clang lld xz-utils \
-  libclang-dev llvm-dev libcap-ng-dev
-
-# libkrun needs current stable Rust (edition2024 crates)
-curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-
-# install Zig 0.17.0 for your Linux architecture
-```
-
-- Node.js >= 22.19
-
-> **Note:** Runtime validation is currently strongest on ARM64 (Apple Silicon, Linux aarch64).
-> Linux x86_64 is currently smoke-tested for `make krun-runner` in CI.
+Installing this package also installs, as optional platform packages, the
+Gondolin daemon (`gondolind`, `@earendil-works/gondolin-native-*` for macOS
+and Linux on arm64 and x64) and, on macOS arm64 and Linux x86_64, the krun
+runner. VMs use libkrun where it can run (Apple silicon, Linux x86_64 with
+read/write `/dev/kvm`), which needs nothing else installed, and QEMU
+otherwise. See
+[Installation](https://earendil-works.github.io/gondolin/install/) for
+details, installs without optional dependencies (`GONDOLIN_NATIVE_BIN`), Linux
+arm64 krun, and building from a checkout.
 
 ## Installation
 
@@ -73,6 +55,10 @@ npx @earendil-works/gondolin snapshot <session-id>
 # Resume from snapshot id/path
 npx @earendil-works/gondolin bash --resume <snapshot-id-or-path>
 ```
+
+The same commands (except `build` and `tools`) are also available without
+Node.js in the static `gondolin` binary of the platform packages; see
+[CLI: Static CLI](https://earendil-works.github.io/gondolin/cli/#static-cli-no-nodejs).
 
 Guest images (~200MB) are automatically resolved on first run via
 `builtin-image-registry.json` and cached in `~/.cache/gondolin/images/`.
@@ -104,8 +90,8 @@ const vm = await VM.create({
 
 // NOTE:
 // - `vm.exec("...")` runs via `/bin/sh -lc "..."` (shell features work)
-// - `vm.exec([cmd, ...argv])` executes `cmd` directly and does not search `$PATH`
-//   so `cmd` must be an absolute path
+// - `vm.exec([cmd, ...argv])` executes `cmd` directly (no shell); a bare name
+//   is looked up in the guest's `$PATH`
 const cmd = `
   curl -sS -f \
     -H "Accept: application/vnd.github+json" \
@@ -175,8 +161,9 @@ const vm = await VM.create({
 });
 ```
 
-`syntheticHostMapping: "per-host"` is required so the host can map outbound
-TCP connections on port `22` back to the intended hostname.
+`syntheticHostMapping: "per-host"` (the default when `ssh` is configured) is
+required so the host can map outbound TCP connections on port `22` back to the
+intended hostname.
 
 When credentials or an SSH agent are configured, the host terminates the guest SSH
 session and proxies `exec` requests (including Git smart-protocol commands) to the

@@ -5,9 +5,9 @@
 AI agents increasingly run generated code without human review.  That code often
 needs network access and credentials, which creates exfiltration risk.
 
-Gondolin runs that code inside a fast local Linux micro-VM (QEMU by default,
-with an optional experimental `krun` backend) while keeping network and
-filesystem access under host-side policy control.  That policy layer can be
+Gondolin runs that code inside a fast local Linux micro-VM (`libkrun` where
+available, QEMU otherwise) while keeping network and filesystem access under
+host-side policy control.  That policy layer can be
 customized via JavaScript.
 
 ## Quick Example
@@ -20,7 +20,7 @@ const { httpHooks, env } = createHttpHooks({
   secrets: {
     GITHUB_TOKEN: {
       hosts: ["api.github.com"],
-      value: process.env.GITHUB_TOKEN,
+      value: process.env.GITHUB_TOKEN!,
     },
   },
 });
@@ -67,52 +67,28 @@ npx @earendil-works/gondolin snapshot <session-id>
 npx @earendil-works/gondolin bash --resume <snapshot-id-or-path>
 ```
 
-Guest assets (kernel/initramfs/rootfs plus optional krun boot artifacts,
-~200MB+) are resolved automatically on first use via
-`builtin-image-registry.json` and cached locally. When no image is specified,
-Gondolin uses `GONDOLIN_DEFAULT_IMAGE` (default: `alpine-base:latest`).
+Guest images (~200MB+) are downloaded on first use from the builtin registry
+and cached locally (default: `alpine-base:latest`).
 
-Requirements:
+## Requirements
 
-| macOS                    | Linux (Debian/Ubuntu)                         |
-| ------------------------ | --------------------------------------------- |
-| `brew install qemu node` | `sudo apt install qemu-system-arm nodejs npm` |
+| Host                                 | VM backend | Install                                                    |
+| ------------------------------------ | ---------- | ---------------------------------------------------------- |
+| macOS, Apple silicon                 | krun       | Node.js only (`brew install node`)                         |
+| Linux x86_64 with `/dev/kvm`         | krun       | Node.js only                                               |
+| macOS, Intel                         | QEMU       | `brew install qemu node`                                   |
+| Linux arm64 (Debian/Ubuntu)          | QEMU       | `sudo apt install qemu-system-arm nodejs npm`              |
+| Linux x86_64 without `/dev/kvm`      | QEMU (TCG) | `sudo apt install qemu-system-x86 nodejs npm`              |
 
-Optional experimental libkrun backend setup:
-
-```bash
-make krun-runner
-```
-
-Published installs of `@earendil-works/gondolin` also include platform-specific
-optional runner packages for supported targets.
-
-This stages `libkrun` under `.cache/` (no global install) and builds the local
-runner helper at `host/krun-runner/zig-out/bin/gondolin-krun-runner`.
-On macOS, the build ad-hoc signs the runner with the
-`com.apple.security.hypervisor` entitlement so Hypervisor.framework access is allowed.
-When present, Gondolin auto-detects this runner for `--vmm krun`.
-
-Linux prerequisites for `make krun-runner` (Ubuntu/Debian):
-
-```bash
-sudo apt install \
-  build-essential curl git make pkg-config clang lld xz-utils \
-  libclang-dev llvm-dev libcap-ng-dev
-
-# libkrun requires a modern Rust toolchain (edition2024)
-curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-
-# install Zig 0.17.0 for your Linux architecture
-```
-
-When `vmm=krun` is selected, Gondolin requires krun boot assets from the selected
-image manifest (`assets.krunKernel` and optional `assets.krunInitrd`).
-For custom kernels/initrds, provide an explicit `sandbox.imagePath` asset object.
-
-> Linux and macOS are supported. ARM64 is the most tested runtime path today.
-> Linux x86_64 `make krun-runner` is covered by CI smoke builds.
+Node.js 22.19 or newer. `npm install @earendil-works/gondolin` also installs
+the platform packages with the Gondolin daemon (`gondolind`, macOS and Linux on
+arm64 and x64) and, on macOS arm64 and Linux x86_64, the krun runner. VMs run
+on libkrun where it can (Apple silicon, Linux x86_64 with read/write
+`/dev/kvm`) and on QEMU otherwise, so QEMU is only needed on the other hosts
+or when you select the `qemu` backend. See
+[Installation](https://earendil-works.github.io/gondolin/install/) for the
+details, krun on Linux arm64, the static CLI without Node.js, and building
+from a checkout.
 
 ## Feature Highlights
 
@@ -127,20 +103,22 @@ For custom kernels/initrds, provide an explicit `sandbox.imagePath` asset object
   - optional guest -> upstream allowlisted SSH egress (proxied, exec-oriented)
 - **Disk checkpoints (snapshots)** with resume support
 - **Custom image builds** (Alpine-based build pipeline, optional OCI rootfs source)
+- **Remote machines**: the VM runs under a static Rust daemon (`gondolind`) that also works on another machine without Node.js, while policy, hooks and credentials stay local; the same binary is a static CLI
+- **Daemon-side policies**: self-contained JavaScript policies (`createDjsHooks()`, `--hooks-script`) that run inside the daemon without a round trip to your process
 - **Configurable DNS behavior** (`synthetic`, `trusted`, `open`), rootfs modes (`readonly`, `memory`, `cow`), and runtime rootfs sizing
 
 ## Documentation
 
-- [Introduction](https://earendil-works.github.io/gondolin/)
-- [CLI](https://earendil-works.github.io/gondolin/cli/)
-- [SDK](https://earendil-works.github.io/gondolin/sdk/)
-- [Secrets Handling](https://earendil-works.github.io/gondolin/secrets/)
-- [SSH](https://earendil-works.github.io/gondolin/ssh/)
-- [Custom Images](https://earendil-works.github.io/gondolin/custom-images/)
-- [Architecture Overview](https://earendil-works.github.io/gondolin/architecture/)
-- [VM Backends (QEMU vs krun)](docs/backends.md)
-- [Security Design](https://earendil-works.github.io/gondolin/security/)
-- [Limitations](https://earendil-works.github.io/gondolin/limitations/)
+- [Installation](https://earendil-works.github.io/gondolin/install/) and [Quick Start](https://earendil-works.github.io/gondolin/quickstart/)
+- [Running Commands](https://earendil-works.github.io/gondolin/exec/)
+- [Network Access](https://earendil-works.github.io/gondolin/network-access/), [HTTP Hooks and Policies](https://earendil-works.github.io/gondolin/hooks/) and [Secrets](https://earendil-works.github.io/gondolin/secrets/)
+- [Files and Mounts](https://earendil-works.github.io/gondolin/vfs/) and [Persistence and Snapshots](https://earendil-works.github.io/gondolin/snapshots/)
+- [Ingress](https://earendil-works.github.io/gondolin/ingress/) and [SSH](https://earendil-works.github.io/gondolin/ssh/)
+- [Images](https://earendil-works.github.io/gondolin/images/) and [Building Custom Images](https://earendil-works.github.io/gondolin/custom-images/)
+- [Remote Machines](https://earendil-works.github.io/gondolin/remote/)
+- [CLI Reference](https://earendil-works.github.io/gondolin/cli/), [SDK Reference](https://earendil-works.github.io/gondolin/sdk/) and [Environment Variables](https://earendil-works.github.io/gondolin/environment/)
+- [Architecture](https://earendil-works.github.io/gondolin/architecture/), [Security Design](https://earendil-works.github.io/gondolin/security/) and [Limitations](https://earendil-works.github.io/gondolin/limitations/)
+- [Upgrading](https://earendil-works.github.io/gondolin/upgrading/)
 
 ## Repository Guides
 

@@ -30,10 +30,13 @@ jobs:
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build
         run: make docs
+        env:
+          # Broken links between pages fail the build.
+          DOCS_STRICT: "1"
 
       # Upload artifact for GitHub Pages deployment (only on main)
       - name: Upload Pages artifact

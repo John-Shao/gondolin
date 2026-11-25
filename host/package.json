@@ -23,6 +23,8 @@
     "start": "node dist/bin/gondolin.js exec",
     "dev": "node bin/gondolin.ts exec",
     "test": "node --test test/*.test.ts",
+    "test:native": "./scripts/test-native.sh",
+    "test:native:remote": "./scripts/test-native-remote.sh",
     "test:backend-parity": "node --test test/backend-parity.test.ts",
     "bash": "node bin/gondolin.ts bash",
     "gondolin": "node bin/gondolin.ts",
@@ -47,18 +49,22 @@
   },
   "license": "Apache-2.0",
   "dependencies": {
-    "cbor2": "^2.3.0",
-    "ssh2": "^1.17.0",
-    "undici": "^6.29.0"
+    "cbor2": "^2.3.0"
   },
   "optionalDependencies": {
     "@earendil-works/gondolin-krun-runner-darwin-arm64": "0.14.0",
-    "@earendil-works/gondolin-krun-runner-linux-x64": "0.14.0"
+    "@earendil-works/gondolin-krun-runner-linux-x64": "0.14.0",
+    "@earendil-works/gondolin-native-darwin-arm64": "0.14.0",
+    "@earendil-works/gondolin-native-darwin-x64": "0.14.0",
+    "@earendil-works/gondolin-native-linux-arm64": "0.14.0",
+    "@earendil-works/gondolin-native-linux-x64": "0.14.0"
   },
   "devDependencies": {
     "@types/node": "22.19.21",
     "@types/ssh2": "1.15.6",
-    "typescript": "7.0.2"
+    "ssh2": "^1.17.0",
+    "typescript": "7.0.2",
+    "undici": "^6.29.0"
   },
   "engines": {
     "node": ">=22.19.0"

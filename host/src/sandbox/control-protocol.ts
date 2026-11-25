@@ -9,6 +9,7 @@
  * - exec { type: "exec", id, cmd, argv?, env?, cwd?, stdin?, pty? }
  * - stdin { type: "stdin", id, data?: base64 string, eof? }
  * - pty_resize { type: "pty_resize", id, rows, cols }
+ * - exec_signal { type: "exec_signal", id, signal } (Linux signal number)
  * - lifecycle { type: "lifecycle", action: "restart" | "shutdown" }
  * - snapshot { type: "snapshot", id, path }
  * - boot { type: "boot", fuseMount?, fuseBinds? }
@@ -16,6 +17,7 @@
  * Server → Client:
  * - status { type: "status", state: "starting" | "running" | "stopped" }
  * - exec_response { type: "exec_response", id, exit_code, signal? }
+ * - stdin_ack { type: "stdin_ack", id, bytes } (stdin bytes forwarded to the guest)
  * - snapshot_response { type: "snapshot_response", id, path, name }
  * - error { type: "error", id?, code, message }
  *
@@ -25,6 +27,10 @@
  * +---------+-----------+-------------------+
  * tag = 1 stdout, tag = 2 stderr, id big-endian.
  */
+
+/** VM lifecycle state */
+export type SandboxState = "starting" | "running" | "stopped";
+
 export type ExecCommandMessage = {
   type: "exec";
   /** request id */
@@ -52,8 +58,8 @@ export type StdinCommandMessage = {
   type: "stdin";
   /** request id */
   id: number;
-  /** stdin chunk as base64 */
-  data?: string;
+  /** stdin chunk as base64, or raw bytes from in-process clients */
+  data?: string | Buffer;
   /** whether this chunk closes stdin */
   eof?: boolean;
 };
@@ -66,6 +72,14 @@ export type PtyResizeCommandMessage = {
   rows: number;
   /** pty column count */
   cols: number;
+};
+
+export type ExecSignalCommandMessage = {
+  type: "exec_signal";
+  /** request id */
+  id: number;
+  /** Linux signal number (1-64) */
+  signal: number;
 };
 
 export type LifecycleCommandMessage = {
@@ -105,6 +119,7 @@ export type ClientMessage =
   | ExecCommandMessage
   | StdinCommandMessage
   | PtyResizeCommandMessage
+  | ExecSignalCommandMessage
   | ExecWindowCommandMessage
   | LifecycleCommandMessage
   | SnapshotCommandMessage;
@@ -117,6 +132,18 @@ export type ExecResponseMessage = {
   exit_code: number;
   /** termination signal (if any) */
   signal?: number;
+};
+
+/**
+ * Stdin bytes of an exec that left the server's queue towards the guest; the
+ * client keeps its unacknowledged stdin bounded with it (backpressure).
+ */
+export type StdinAckMessage = {
+  type: "stdin_ack";
+  /** request id */
+  id: number;
+  /** acknowledged stdin in `bytes` */
+  bytes: number;
 };
 
 export type ErrorMessage = {
@@ -142,11 +169,12 @@ export type SnapshotResponseMessage = {
 export type StatusMessage = {
   type: "status";
   /** sandbox state */
-  state: "starting" | "running" | "stopped";
+  state: SandboxState;
 };
 
 export type ServerMessage =
   | ExecResponseMessage
+  | StdinAckMessage
   | ErrorMessage
   | SnapshotResponseMessage
   | StatusMessage;

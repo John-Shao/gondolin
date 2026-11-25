@@ -9,16 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { AsyncSingleflight } from "../utils/async.ts";
 
-import {
-  createTempQcow2Overlay,
-  ensureDiskImageMinimumSize,
-  ensureQemuImgAvailable,
-  inferDiskFormatFromPath,
-  moveFile,
-  parseDiskSizeToBytes,
-  rebaseQcow2InPlace,
-  resolveQcow2BackingPath,
-} from "../qemu/img.ts";
+import { inferDiskFormatFromPath, parseDiskSizeToBytes } from "./disk.ts";
 import {
   VmCheckpoint,
   registerVmCreate,
@@ -31,11 +22,20 @@ import {
   type ErrorMessage,
   type ExecResponseMessage,
   type StatusMessage,
+  type StdinAckMessage,
   decodeOutputFrame,
   type ClientMessage,
 } from "../sandbox/control-protocol.ts";
-import { SandboxServer } from "../sandbox/server.ts";
-import { assertMacHypervisorEntitlement } from "../sandbox/krun-controller.ts";
+import { NativeSandboxServer } from "../native/server.ts";
+import { NativeFsClient, type NativeVfsSpec } from "../native/vfs.ts";
+import {
+  type NativeRootDisk,
+  type SandboxEngine,
+  resolveNativeEngineOptions,
+  resolveVmEngine,
+} from "../native/config.ts";
+import { resolveRemoteSandboxOptions } from "../native/remote.ts";
+import { assertMacHypervisorEntitlement } from "../utils/krun-entitlement.ts";
 import {
   type ResolvedSandboxServerOptions,
   type SandboxServerOptions,
@@ -44,14 +44,18 @@ import {
   resolveSandboxServerOptionsAsync,
 } from "../sandbox/server-options.ts";
 import type { SandboxConnection } from "../sandbox/client.ts";
-import type { SandboxState } from "../sandbox/controller.ts";
+import type { SandboxState } from "../sandbox/control-protocol.ts";
 import {
   SessionIpcServer,
   gcSessions,
   registerSession,
   unregisterSession,
 } from "../session-registry.ts";
-import { createMitmCaProvider, resolveMitmMounts } from "./mitm-vfs.ts";
+import {
+  createMitmCaProvider,
+  mitmCaSetters,
+  resolveMitmMounts,
+} from "./mitm-vfs.ts";
 import type { EnvInput, VMOptions, VmVfsOptions } from "./types.ts";
 import {
   buildShellEnv,
@@ -99,6 +103,9 @@ import {
   rejectExecSession,
   resolveOutputMode,
   applyOutputChunk,
+  ackStdin,
+  addPendingStdin,
+  waitStdinDrain,
   normalizeCommand,
   toAsyncIterable,
 } from "../exec.ts";
@@ -106,6 +113,8 @@ import { errorMessage } from "../utils/error.ts";
 
 const MAX_REQUEST_ID = 0xffffffff;
 const DEFAULT_STDIN_CHUNK = 32 * 1024;
+/** upper bound of one stdin message in `bytes` */
+const MAX_STDIN_CHUNK = 256 * 1024;
 const DEFAULT_VM_START_TIMEOUT_MS = 120000;
 const VM_START_TIMEOUT_MS = resolveEnvNumber(
   "GONDOLIN_START_TIMEOUT_MS",
@@ -132,9 +141,10 @@ function normalizeStartTimeoutMs(
   return Math.max(0, Math.trunc(value));
 }
 const DEFAULT_VFS_READY_TIMEOUT_MS = 30000;
+// the mounts land a few ms after the guest reports the VFS ready: poll often
 const VFS_READY_SLEEP_SECONDS = resolveEnvNumber(
   "GONDOLIN_VFS_READY_SLEEP_SECONDS",
-  0.1,
+  0.01,
 );
 const VFS_READY_TIMEOUT_MS = resolveEnvNumber(
   "GONDOLIN_VFS_READY_TIMEOUT_MS",
@@ -165,6 +175,7 @@ export type {
   VmFsWriteFileOptions,
   VmFsDeleteOptions,
 } from "./fs.ts";
+import { linuxSignalNumber } from "../utils/signals.ts";
 export type { VMOptions, VmRootfsOptions, VmVfsOptions } from "./types.ts";
 
 export type ShellOptions = {
@@ -206,19 +217,6 @@ export type SshAccess = {
 
 export type VMState = SandboxState | "unknown";
 
-type RootDiskState = {
-  /** root disk image path */
-  path: string;
-  /** root disk image format */
-  format: "raw" | "qcow2";
-  /** backend-native ephemeral snapshot mode */
-  snapshot: boolean;
-  /** readonly mode for the root disk */
-  readOnly: boolean;
-  /** delete the disk file on vm.close() */
-  deleteOnClose: boolean;
-};
-
 export class VM {
   /**
    * Replace the debug log callback.
@@ -233,12 +231,23 @@ export class VM {
   /** guest filesystem operations */
   readonly fs: VmFs;
   private readonly autoStart: boolean;
+  /** `start()` was called (with `autoStart: false` only it boots the VM) */
+  private startRequested = false;
   private readonly startTimeoutMs: number;
   private readonly sessionLabel: string | undefined;
-  private server: SandboxServer | null;
+  private server: NativeSandboxServer | null;
+  /** host engine implementation */
+  readonly engine: SandboxEngine;
+  /** gondolind runs on another machine (no shared filesystem) */
+  readonly remote: boolean;
   private readonly resolvedSandboxOptions: ResolvedSandboxServerOptions;
-  private rootDisk: RootDiskState | null = null;
+  /** root disk the daemon prepares (`configure.vm.root_disk`) */
+  private readonly rootDisk: NativeRootDisk;
+  /** the controller's own disk to delete on close (`sandbox.rootDiskDeleteOnClose`) */
+  private deleteOnClosePath: string | null = null;
   private checkpointed = false;
+  /** the checkpoint being written (`close()` waits for it) */
+  private checkpointInFlight: Promise<unknown> | null = null;
   /** whether `close()` was called; a closed vm must not be restarted */
   private closed = false;
   private readonly baseOptionsForClone: VMOptions;
@@ -295,9 +304,6 @@ export class VM {
     const sandboxOptions: SandboxServerOptions = { ...options.sandbox };
 
     // Build the combined sandbox options
-    if (options.fetch && sandboxOptions.fetch === undefined) {
-      sandboxOptions.fetch = options.fetch;
-    }
     if (options.httpHooks && sandboxOptions.httpHooks === undefined) {
       sandboxOptions.httpHooks = options.httpHooks;
     }
@@ -339,6 +345,13 @@ export class VM {
       sandboxOptions.tmpfs = options.tmpfs;
     }
 
+    // A remote daemon resolves (and downloads) its own image
+    const native = resolveNativeEngineOptions(options.native);
+    resolveVmEngine(options.engine, native);
+    if (native.remote) {
+      return new VM(options);
+    }
+
     // Resolve options with asset fetching
     const resolvedSandboxOptions =
       await resolveSandboxServerOptionsAsync(sandboxOptions);
@@ -362,6 +375,9 @@ export class VM {
     resolvedSandboxOptions?: ResolvedSandboxServerOptions,
   ) {
     this.id = randomUUID();
+    const native = resolveNativeEngineOptions(options.native);
+    this.engine = resolveVmEngine(options.engine, native);
+    this.remote = Boolean(native.remote);
     this.baseOptionsForClone = { ...options };
     this.autoStart = options.autoStart ?? true;
     this.startTimeoutMs = normalizeStartTimeoutMs(options.startTimeoutMs);
@@ -414,6 +430,7 @@ export class VM {
     this.fuseMount = fuseConfig.fuseMount;
     this.fuseBinds = fuseConfig.fuseBinds;
 
+    const caSetters = mitmCaSetters(mitmMounts);
     const sandboxOptions: SandboxServerOptions = { ...options.sandbox };
     if (sandboxOptions.vfsProvider && options.vfs) {
       throw new Error("VM cannot specify both vfs and sandbox.vfsProvider");
@@ -424,6 +441,7 @@ export class VM {
         sandboxOptions.mitmCertDir,
         sandboxOptions.netEnabled ?? true,
       );
+      caSetters.push(...mitmCaSetters(injectedMounts));
       if (Object.keys(injectedMounts).length > 0) {
         const normalized = normalizeMountMap({
           "/": sandboxOptions.vfsProvider,
@@ -443,10 +461,21 @@ export class VM {
     this.shortcutBindMounts = this.fuseBinds
       .filter((mountPath) => mountPath !== this.fuseMount)
       .sort((a, b) => b.length - a.length);
+    const nativeVfs: NativeVfsSpec | undefined = this.vfs
+      ? {
+          mounts: fuseMounts,
+          hooks: sandboxOptions.vfsProvider ? undefined : options.vfs?.hooks,
+          fuseMount: this.fuseMount,
+          fuseBinds: this.fuseBinds,
+          gondolinEtc: this.gondolinEtc
+            ? {
+                provider: this.gondolinEtc.provider,
+                listeners: this.gondolinEtc.listeners,
+              }
+            : undefined,
+        }
+      : undefined;
 
-    if (options.fetch && sandboxOptions.fetch === undefined) {
-      sandboxOptions.fetch = options.fetch;
-    }
     if (options.httpHooks && sandboxOptions.httpHooks === undefined) {
       sandboxOptions.httpHooks = options.httpHooks;
     }
@@ -492,9 +521,15 @@ export class VM {
     }
 
     // Resolve sandbox options (sync) if needed so we can prepare the root disk.
-    const resolved = resolvedSandboxOptions
-      ? ({ ...resolvedSandboxOptions } as ResolvedSandboxServerOptions)
-      : resolveSandboxServerOptions(sandboxOptions);
+    // Remote daemons resolve assets themselves: no local paths at all.
+    const remoteResolution = this.remote
+      ? resolveRemoteSandboxOptions(sandboxOptions, native)
+      : null;
+    const resolved = remoteResolution
+      ? remoteResolution.resolved
+      : resolvedSandboxOptions
+        ? ({ ...resolvedSandboxOptions } as ResolvedSandboxServerOptions)
+        : resolveSandboxServerOptions(sandboxOptions);
 
     // Merge VFS provider into resolved options
     if (this.vfs) {
@@ -507,59 +542,91 @@ export class VM {
       sandboxOptions.rootDiskReadOnly !== undefined ||
       sandboxOptions.rootDiskDeleteOnClose !== undefined;
 
-    const manifestRootfsMode = resolveManifestRootfsMode(resolved);
-    const rootfsMode = options.rootfs?.mode ?? manifestRootfsMode ?? "cow";
-    const supportsSnapshotRootDisk = (resolved.vmm ?? "qemu") === "qemu";
-
-    try {
-      // Prepare root disk:
-      // - Explicit sandbox.rootDisk* options win.
-      // - Otherwise, use rootfs mode from VM options/manifest/default.
-      if (hasUserRootDiskConfig) {
-        this.rootDisk = prepareConfiguredRootDisk(resolved, sandboxOptions);
-      } else if (rootfsMode === "readonly") {
-        this.rootDisk = prepareBaseRootDisk(resolved, {
-          readOnly: true,
-          snapshot: false,
-        });
-      } else if (rootfsMode === "memory") {
-        this.rootDisk =
-          supportsSnapshotRootDisk && rootfsSizeBytes === null
-            ? prepareBaseRootDisk(resolved, {
-                readOnly: false,
-                snapshot: true,
-              })
-            : prepareOverlayRootDisk(resolved);
-      } else if (rootfsMode === "cow") {
-        this.rootDisk = prepareOverlayRootDisk(resolved);
+    // The root disk is prepared by the daemon (overlay, memory/readonly
+    // modes, size, checkpoint rebasing); local and remote sessions differ
+    // only in who names the image's rootfs.
+    const size = rootfsSizeBytes ?? undefined;
+    if (this.remote) {
+      this.rootDisk = {
+        path: "",
+        format: "",
+        mode: native.checkpoint
+          ? "checkpoint"
+          : (options.rootfs?.mode ?? "auto"),
+        size,
+      };
+    } else {
+      const rootfsDisk = {
+        path: resolved.rootfsPath,
+        format: inferDiskFormatFromPath(resolved.rootfsPath),
+      };
+      const rootfsMode =
+        options.rootfs?.mode ?? resolveManifestRootfsMode(resolved) ?? "cow";
+      if (native.checkpoint) {
+        this.rootDisk = { ...rootfsDisk, mode: "checkpoint", size };
+      } else if (hasUserRootDiskConfig) {
+        // (without rootDiskPath configuredRootDisk refuses deleting the rootfs)
+        if (
+          sandboxOptions.rootDiskDeleteOnClose &&
+          sandboxOptions.rootDiskPath !== undefined
+        ) {
+          this.deleteOnClosePath = sandboxOptions.rootDiskPath;
+        }
+        try {
+          this.rootDisk = configuredRootDisk(resolved, sandboxOptions, size);
+        } catch (err) {
+          this.cleanupRootDiskSync();
+          throw err;
+        }
+      } else if (
+        rootfsMode === "readonly" ||
+        rootfsMode === "memory" ||
+        rootfsMode === "cow"
+      ) {
+        if (rootfsMode === "readonly" && size !== undefined) {
+          throw new Error(
+            "rootfs.size requires a writable root disk (rootfs.mode cannot be readonly)",
+          );
+        }
+        this.rootDisk = { ...rootfsDisk, mode: rootfsMode, size };
       } else {
         throw new Error(`unsupported rootfs mode: ${String(rootfsMode)}`);
       }
+    }
+    if (size !== undefined) this.rootfsGuestResizePending = true;
 
-      if (rootfsSizeBytes !== null) {
-        prepareRootDiskResize(
-          this.rootDisk,
-          resolved.rootfsPath,
-          rootfsSizeBytes,
-        );
-        this.rootfsGuestResizePending = true;
-      }
+    this.resolvedSandboxOptions = resolved;
+    const serverInternalOptions = {
+      rootDisk: this.rootDisk,
+      checkpoint: native.checkpoint,
+      native,
+      nativeVfs,
+      setMitmCaCert: (certPem: string) => {
+        for (const set of caSetters) set(certPem);
+      },
+      remote: remoteResolution
+        ? {
+            image: remoteResolution.image,
+            qemuPath: sandboxOptions.qemuPath,
+            krunRunnerPath: sandboxOptions.krunRunnerPath,
+          }
+        : undefined,
+    };
+    try {
+      this.server = new NativeSandboxServer(
+        resolved,
+        serverInternalOptions,
+        options.sandbox,
+      );
     } catch (err) {
       this.cleanupRootDiskSync();
       throw err;
     }
-
-    this.resolvedSandboxOptions = resolved;
-    this.server = new SandboxServer(resolved, {
-      qemuRootDiskVolatileMode: this.rootDisk?.snapshot
-        ? "snapshot"
-        : undefined,
-    });
     this.fs = new VmFsController({
-      start: () => this.start(),
+      start: () => this.startImplicitly(),
       exec: (command, fsOptions = {}) => this.exec(command, fsOptions),
       getServer: () => this.server,
-      vfs: this.vfs,
+      vfs: this.nativeFsView(),
       fuseMount: this.fuseMount,
       shortcutBindMounts: this.shortcutBindMounts,
     });
@@ -594,7 +661,36 @@ export class VM {
    *
    * If VFS is configured, this also waits for the VFS mount(s) to be ready.
    */
+  /** `vm.fs` provider: daemon-owned native mounts go through `fs_call` */
+  private nativeFsView(): SandboxVfsProvider | null {
+    const server = this.server;
+    const nativeVfs =
+      server instanceof NativeSandboxServer ? server.getNativeVfs() : null;
+    if (!nativeVfs || !this.vfs) return this.vfs;
+    return NativeFsClient.forVm(
+      nativeVfs,
+      this.vfs,
+      (p) => server!.fsCall(p) as Promise<any>,
+      () => this.startImplicitly(),
+    ) as unknown as SandboxVfsProvider;
+  }
+
   async start() {
+    this.startRequested = true;
+    return this.startSingleflight.run(() => this.startInternal());
+  }
+
+  /**
+   * Start for an operation that needs a running VM (`exec`, `vm.fs`,
+   * `enableSsh`, ...): with `autoStart: false` the VM must have been started
+   * with {@link start} first.
+   */
+  private async startImplicitly() {
+    if (!this.autoStart && !this.startRequested) {
+      throw new Error(
+        "vm is not started (autoStart: false); call vm.start() first",
+      );
+    }
     return this.startSingleflight.run(() => this.startInternal());
   }
 
@@ -602,8 +698,32 @@ export class VM {
    * Close the VM and release associated resources.
    */
   async close() {
+    // a checkpoint in progress owns the shutdown (its export stops the VM
+    // and its caller, e.g. the CLI on `sandbox_stopped`, may close meanwhile)
+    const inFlight = this.checkpointInFlight;
+    if (inFlight) await inFlight.catch(() => undefined);
     this.closed = true;
     return this.closeSingleflight.run(() => this.closeInternal());
+  }
+
+  /**
+   * @internal The native engine's `configure` payload and the default guest
+   * environment, without starting anything (`gondolin --print-configure`).
+   */
+  async describeNativeConfigure(): Promise<{
+    configure: Record<string, unknown>;
+    env: string[];
+  }> {
+    if (!this.server) {
+      throw new Error("sandbox server is not available");
+    }
+    return {
+      configure: (await this.server.buildConfigure()) as Record<
+        string,
+        unknown
+      >,
+      env: mergeEnvInputs(this.defaultEnv, undefined) ?? [],
+    };
   }
 
   /**
@@ -627,7 +747,8 @@ export class VM {
    * const r1 = await vm.exec("echo hello");
    * console.log(r1.stdout); // 'hello\n'
    *
-   * // Array form executes an executable directly (does not search `$PATH`)
+   * // Array form executes the program directly, without a shell (a bare name
+   * // is looked up in the guest's `$PATH`)
    * const r2 = await vm.exec(["/bin/echo", "hello"]);
    * console.log(r2.stdout); // 'hello\n'
    *
@@ -659,7 +780,7 @@ export class VM {
    * const result = await vm.shell();
    * process.exit(result.exitCode);
    *
-   * // Custom command (absolute path required)
+   * // Custom command
    * const result = await vm.shell({ command: "/bin/sh" });
    *
    * // Manual control
@@ -711,7 +832,7 @@ export class VM {
   async enableSsh(options: EnableSshOptions = {}): Promise<SshAccess> {
     if (this.sshAccess) return this.sshAccess;
 
-    await this.start();
+    await this.startImplicitly();
 
     const user = options.user ?? "root";
     const listenHost = options.listenHost ?? "127.0.0.1";
@@ -1030,7 +1151,7 @@ fi
   ): Promise<IngressAccess> {
     if (this.ingressAccess) return this.ingressAccess;
 
-    await this.start();
+    await this.startImplicitly();
 
     if (!this.gondolinEtc) {
       throw new Error(
@@ -1059,6 +1180,7 @@ fi
 
     const stdout = resolveOutputMode(options.stdout, options.buffer, "stdout");
     const stderr = resolveOutputMode(options.stderr, options.buffer, "stderr");
+    const killSignal = linuxSignalNumber(options.killSignal ?? "SIGKILL");
 
     const session = createExecSession(id, {
       stdinEnabled,
@@ -1069,17 +1191,23 @@ fi
       windowBytes: options.windowBytes,
     });
 
-    // Setup abort handling
+    this.sessions.set(id, session);
+
+    // Setup abort handling: stop the command in the guest, then reject
     if (options.signal) {
       const onAbort = () => {
+        if (!this.sessions.has(id)) return;
+        this.sendExecSignal(id, killSignal);
         rejectExecSession(session, new Error("exec aborted"));
         this.sessions.delete(id);
       };
-      options.signal.addEventListener("abort", onAbort, { once: true });
       session.signalListener = onAbort;
+      if (options.signal.aborted) {
+        queueMicrotask(onAbort);
+      } else {
+        options.signal.addEventListener("abort", onAbort, { once: true });
+      }
     }
-
-    this.sessions.set(id, session);
 
     // Wire up credit-based flow control
     session.sendWindowUpdate = (stdoutBytes, stderrBytes) => {
@@ -1101,6 +1229,7 @@ fi
       sendStdin: (id, data) => this.sendStdinData(id, data),
       sendStdinEof: (id) => this.sendStdinEof(id),
       sendResize: (id, rows, cols) => this.sendPtyResize(id, rows, cols),
+      sendSignal: (id, signal) => this.sendExecSignal(id, signal),
       cleanup: (id) => this.sessions.delete(id),
     });
 
@@ -1119,7 +1248,7 @@ fi
     stdinSetting: ExecStdin | undefined,
   ) {
     try {
-      await this.start();
+      await this.startImplicitly();
 
       const mergedEnv = mergeEnvInputs(this.defaultEnv, options.env);
 
@@ -1136,6 +1265,8 @@ fi
         stderr_window: session.windowBytes,
       };
 
+      // aborted while the VM was starting: never start the command
+      if (!this.sessions.has(id)) return;
       this.sendJson(message);
       this.markSessionReady(session);
 
@@ -1162,8 +1293,29 @@ fi
       throw new Error("sandbox server is not available");
     }
 
+    if (this.remote) {
+      // the daemon checks its VMM binary when the session starts
+      this.vmmChecked = true;
+      return;
+    }
+
+    // only the selected backend's binary is needed (QEMU only for vmm=qemu)
     const vmmPath = server.getVmmPath();
-    execFileSync(vmmPath, ["--version"], { stdio: "ignore" });
+    try {
+      execFileSync(vmmPath, ["--version"], { stdio: "ignore" });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT" && server.getVmmBackend() === "qemu") {
+        const error: NodeJS.ErrnoException = new Error(
+          `QEMU binary '${vmmPath}' not found: install QEMU or use the krun backend (sandbox.vmm: "krun")`,
+        );
+        // keeps what callers (the CLI) render a friendly message from
+        error.code = code;
+        error.path = vmmPath;
+        throw error;
+      }
+      throw err;
+    }
     if (server.getVmmBackend() === "krun") {
       assertMacHypervisorEntitlement(vmmPath);
     }
@@ -1366,9 +1518,9 @@ fi
   }
 
   private cleanupRootDiskSync() {
-    if (!this.rootDisk?.deleteOnClose) return;
+    if (!this.deleteOnClosePath) return;
     try {
-      fs.rmSync(this.rootDisk.path, { force: true });
+      fs.rmSync(this.deleteOnClosePath, { force: true });
     } catch {
       // ignore
     }
@@ -1439,16 +1591,27 @@ fi
 
   private async pipeStdin(id: number, input: ExecStdin, session: ExecSession) {
     if (!session.stdinEnabled) return;
+    // Send in chunks and wait while too much is unacknowledged so large
+    // inputs never overflow the server's stdin queue.
+    const chunkBytes = this.stdinChunkBytes();
+    const sendAll = async (data: Buffer | string) => {
+      const payload = typeof data === "string" ? Buffer.from(data) : data;
+      for (let offset = 0; offset < payload.length; offset += chunkBytes) {
+        if (!this.sessions.has(id)) return;
+        this.sendStdinData(id, payload.subarray(offset, offset + chunkBytes));
+        await waitStdinDrain(session);
+      }
+    };
     try {
       if (typeof input === "string" || Buffer.isBuffer(input)) {
-        this.sendStdinData(id, input);
-        this.sendStdinEof(id);
+        await sendAll(input);
+        if (this.sessions.has(id)) this.sendStdinEof(id);
       } else if (typeof input === "boolean") {
         // no-op for `true`
       } else {
         for await (const chunk of toAsyncIterable(input)) {
           if (!this.sessions.has(id)) return;
-          this.sendStdinData(id, chunk);
+          await sendAll(chunk);
         }
         if (this.sessions.has(id)) {
           this.sendStdinEof(id);
@@ -1464,6 +1627,12 @@ fi
   private markSessionReady(session: ExecSession) {
     if (session.requestReady) return;
     session.requestReady = true;
+
+    if (session.pendingSignal !== null) {
+      const signal = session.pendingSignal;
+      session.pendingSignal = null;
+      this.sendExecSignalNow(session.id, signal);
+    }
 
     if (session.pendingResize) {
       const { rows, cols } = session.pendingResize;
@@ -1487,6 +1656,10 @@ fi
   private sendStdinData(id: number, data: Buffer | string) {
     const session = this.sessions.get(id);
     if (!session) return;
+    addPendingStdin(
+      session,
+      typeof data === "string" ? Buffer.byteLength(data) : data.length,
+    );
     if (!session.requestReady) {
       session.pendingStdin.push({ type: "data", data });
       return;
@@ -1505,20 +1678,24 @@ fi
   }
 
   private sendStdinDataNow(id: number, data: Buffer | string) {
-    const payload =
-      typeof data === "string" ? Buffer.from(data) : Buffer.from(data);
-    for (
-      let offset = 0;
-      offset < payload.length;
-      offset += DEFAULT_STDIN_CHUNK
-    ) {
-      const slice = payload.subarray(offset, offset + DEFAULT_STDIN_CHUNK);
+    const payload = typeof data === "string" ? Buffer.from(data) : data;
+    const chunkBytes = this.stdinChunkBytes();
+    for (let offset = 0; offset < payload.length; offset += chunkBytes) {
+      // raw bytes (in-process); a copy, so callers may reuse their buffer
       this.sendJson({
         type: "stdin",
         id,
-        data: slice.toString("base64"),
+        data: Buffer.from(payload.subarray(offset, offset + chunkBytes)),
       });
     }
+  }
+
+  /** stdin message size: the server's per-message limit (64 KiB default) */
+  private stdinChunkBytes(): number {
+    const limit = this.resolvedSandboxOptions.maxStdinBytes;
+    return Number.isFinite(limit) && limit > 0
+      ? Math.min(limit, MAX_STDIN_CHUNK)
+      : DEFAULT_STDIN_CHUNK;
   }
 
   private sendStdinEofNow(id: number) {
@@ -1540,6 +1717,31 @@ fi
       return;
     }
     this.sendPtyResizeNow(id, safeRows, safeCols);
+  }
+
+  /**
+   * Signal the exec's process group in the guest (Linux signal number).
+   * Returns `false` when the exec already finished. Before the exec reached
+   * the server the signal is kept and sent right after the exec.
+   */
+  private sendExecSignal(id: number, signal: number): boolean {
+    const session = this.sessions.get(id);
+    if (!session) return false;
+    if (!session.requestReady) {
+      session.pendingSignal = signal;
+      return true;
+    }
+    this.sendExecSignalNow(id, signal);
+    return true;
+  }
+
+  private sendExecSignalNow(id: number, signal: number) {
+    if (!this.connection) return;
+    try {
+      this.sendJson({ type: "exec_signal", id, signal });
+    } catch {
+      // the connection closed: the command dies with the VM
+    }
   }
 
   private sendPtyResizeNow(id: number, rows: number, cols: number) {
@@ -1607,7 +1809,7 @@ fi
 
   private async ensureRunning() {
     const state = await this.waitForStatus();
-    if (state === "stopped" && !this.autoStart) {
+    if (state === "stopped" && !this.autoStart && !this.startRequested) {
       throw new Error("sandbox is stopped");
     }
 
@@ -1657,15 +1859,16 @@ fi
   }
 
   private async waitForVfsReadyInternal() {
-    await this.waitForMount(this.fuseMount, "fuse.sandboxfs");
+    // sandboxfs (FUSE over virtio-serial) or virtio-fs (native engine)
+    await this.waitForMount(this.fuseMount, ["fuse.sandboxfs", "virtiofs"]);
     for (const mountPoint of this.fuseBinds) {
       await this.waitForBindMount(mountPoint);
     }
   }
 
-  private async waitForMount(mountPoint: string, fsType?: string) {
-    const mountCheck = fsType
-      ? `grep -qF -- " $2 ${fsType} " /proc/mounts`
+  private async waitForMount(mountPoint: string, fsTypes?: string[]) {
+    const mountCheck = fsTypes
+      ? `{ ${fsTypes.map((t) => `grep -qF -- " $2 ${t} " /proc/mounts`).join(" || ")}; }`
       : `grep -qF -- " $2 " /proc/mounts`;
     const script = `for i in $(seq 1 ${VFS_READY_ATTEMPTS}); do ${mountCheck} && exit 0; sleep ${VFS_READY_SLEEP_SECONDS}; done; exit 1`;
 
@@ -1693,7 +1896,9 @@ fi
     }
 
     const source = `${this.fuseMount}${mountPoint}`;
-    const script = `for i in $(seq 1 ${VFS_READY_ATTEMPTS}); do if grep -qF -- " $3 " /proc/mounts; then exit 0; fi; mkdir -p "$1"; mount --bind "$2" "$1" > /dev/null 2>&1 || true; sleep ${VFS_READY_SLEEP_SECONDS}; done; exit 1`;
+    // bind it ourselves when the guest's init hasn't yet, and check again
+    // right away (not only after the next sleep)
+    const script = `for i in $(seq 1 ${VFS_READY_ATTEMPTS}); do if grep -qF -- " $3 " /proc/mounts; then exit 0; fi; mkdir -p "$1"; mount --bind "$2" "$1" > /dev/null 2>&1 || true; if grep -qF -- " $3 " /proc/mounts; then exit 0; fi; sleep ${VFS_READY_SLEEP_SECONDS}; done; exit 1`;
 
     const result = await this.execInternalNoVfsWait([
       "/bin/sh",
@@ -1798,12 +2003,17 @@ fi
       return;
     }
 
-    let message: StatusMessage | ExecResponseMessage | ErrorMessage;
+    let message:
+      | StatusMessage
+      | ExecResponseMessage
+      | ErrorMessage
+      | StdinAckMessage;
     try {
       message = JSON.parse(typeof data === "string" ? data : data.toString()) as
         | StatusMessage
         | ExecResponseMessage
-        | ErrorMessage;
+        | ErrorMessage
+        | StdinAckMessage;
     } catch {
       return;
     }
@@ -1815,6 +2025,12 @@ fi
 
     if (message.type === "exec_response") {
       this.handleExecResponse(message);
+      return;
+    }
+
+    if (message.type === "stdin_ack") {
+      const session = this.sessions.get(message.id);
+      if (session) ackStdin(session, Number(message.bytes) || 0);
       return;
     }
 
@@ -1927,7 +2143,49 @@ fi
     });
   }
 
+  /**
+   * Why the root disk cannot be checkpointed, if the controller can tell
+   * (the daemon refuses everything else, e.g. remote `auto` modes)
+   */
+  private checkpointBlocker(): string | null {
+    const disk = this.rootDisk;
+    if (
+      disk.mode === "memory" &&
+      this.resolvedSandboxOptions.vmm === "qemu" &&
+      disk.size === undefined
+    ) {
+      return "cannot checkpoint: root disk is running in ephemeral snapshot mode";
+    }
+    const format =
+      disk.mode === "readonly" || disk.mode === undefined
+        ? disk.format
+        : "qcow2";
+    if (format && format !== "qcow2") {
+      return `cannot checkpoint: root disk must be qcow2 (got ${format})`;
+    }
+    return null;
+  }
+
   private async checkpointInternal(
+    checkpointPath: string,
+    options: {
+      /** keep session attach IPC open until caller performs post-checkpoint cleanup */
+      keepSessionIpc: boolean;
+    },
+  ): Promise<VmCheckpoint> {
+    if (this.checkpointInFlight) {
+      throw new Error("a checkpoint of this vm is already in progress");
+    }
+    const run = this.writeCheckpoint(checkpointPath, options);
+    this.checkpointInFlight = run;
+    try {
+      return await run;
+    } finally {
+      this.checkpointInFlight = null;
+    }
+  }
+
+  private async writeCheckpoint(
     checkpointPath: string,
     options: {
       /** keep session attach IPC open until caller performs post-checkpoint cleanup */
@@ -1942,35 +2200,60 @@ fi
         `checkpointPath must be an absolute path (got: ${checkpointPath})`,
       );
     }
+    const blocker = this.checkpointBlocker();
+    if (blocker) throw new Error(blocker);
 
-    const rootDisk = this.rootDisk;
-    if (!rootDisk) {
-      throw new Error("vm has no root disk");
-    }
-    if (rootDisk.snapshot) {
-      throw new Error(
-        "cannot checkpoint: root disk is running in ephemeral snapshot mode",
-      );
-    }
-    if (rootDisk.format !== "qcow2") {
-      throw new Error(
-        `cannot checkpoint: root disk must be qcow2 (got ${rootDisk.format})`,
-      );
+    // local sessions: the build id of the image's manifest
+    let localManifest: ReturnType<typeof loadAssetManifest> = null;
+    if (!this.remote) {
+      const { kernelPath, initrdPath, rootfsPath } =
+        this.resolvedSandboxOptions;
+      const commonDir =
+        path.dirname(kernelPath) === path.dirname(initrdPath) &&
+        path.dirname(kernelPath) === path.dirname(rootfsPath)
+          ? path.dirname(kernelPath)
+          : null;
+      localManifest = commonDir ? loadAssetManifest(commonDir) : null;
+      if (!localManifest?.buildId) {
+        throw new Error(
+          "cannot checkpoint: guest assets are missing manifest buildId (rebuild guest assets with a newer gondolin build)",
+        );
+      }
     }
 
-    // Ensure the disk isn't deleted by close().
-    rootDisk.deleteOnClose = false;
+    const server = this.server;
+    if (!(server instanceof NativeSandboxServer)) {
+      throw new Error("sandbox server is not available");
+    }
+    // the daemon prepares the disk when its session starts: a VM that never
+    // booted boots now; one whose guest stopped is exported as it is
+    if (!server.isStarted()) {
+      await this.startSingleflight.run(() => this.startInternal());
+    }
 
     // Best-effort flush of guest filesystem buffers so the checkpoint captures
-    // recent writes even though we currently stop QEMU abruptly.
-    if (this.server && this.server.getState() === "running") {
+    // recent writes even though the VMM is stopped abruptly.
+    if (server.getState() === "running") {
       try {
         await this.exec(["/bin/sh", "-c", "sync; sync"]);
       } catch {
         // ignore
       }
     }
-
+    const resolvedCheckpointPath = path.resolve(checkpointPath);
+    fs.mkdirSync(path.dirname(resolvedCheckpointPath), { recursive: true });
+    // the daemon stops the VM, collapses a resumed checkpoint's chain onto
+    // the rootfs and moves (local) or streams (remote) the disk here
+    const partial = `${resolvedCheckpointPath}.partial-${process.pid}`;
+    let exported: { buildId: string | null };
+    try {
+      exported = await server.exportCheckpoint(partial);
+    } catch (err) {
+      fs.rmSync(partial, { force: true });
+      throw err;
+    }
+    // the disk is gone: never delete the checkpoint on close
+    this.deleteOnClosePath = null;
     if (options.keepSessionIpc) {
       await this.closeSingleflight.run(() =>
         this.closeInternal({
@@ -1979,74 +2262,32 @@ fi
         }),
       );
     } else {
-      await this.close();
+      // not close(): it waits for this checkpoint
+      this.closed = true;
+      await this.closeSingleflight.run(() => this.closeInternal());
     }
-
-    const resolvedCheckpointPath = path.resolve(checkpointPath);
-
-    const rootfsPath = path.resolve(this.resolvedSandboxOptions.rootfsPath);
-    const backingPath = resolveQcow2BackingPath(rootDisk.path);
-    if (backingPath && backingPath !== rootfsPath) {
-      // Collapse resume-generated checkpoint ancestry before we publish this
-      // overlay as the new checkpoint file.
-      ensureQemuImgAvailable();
-      rebaseQcow2InPlace(
-        rootDisk.path,
-        rootfsPath,
-        inferDiskFormatFromPath(rootfsPath),
-        "safe",
-      );
-
-      const rebasedBackingPath = resolveQcow2BackingPath(rootDisk.path);
-      if (rebasedBackingPath === resolvedCheckpointPath) {
-        throw new Error(
-          `cannot checkpoint: rebased overlay still points to destination checkpoint path (${resolvedCheckpointPath})`,
-        );
-      }
-    }
-
-    fs.mkdirSync(path.dirname(resolvedCheckpointPath), { recursive: true });
-    fs.rmSync(resolvedCheckpointPath, { force: true });
-
-    moveFile(rootDisk.path, resolvedCheckpointPath);
-
-    const checkpointName = path.basename(
-      resolvedCheckpointPath,
-      path.extname(resolvedCheckpointPath),
-    );
-
-    const guestAssets = {
-      kernelPath: this.resolvedSandboxOptions.kernelPath,
-      initrdPath: this.resolvedSandboxOptions.initrdPath,
-      rootfsPath: this.resolvedSandboxOptions.rootfsPath,
-    };
-
-    const commonDir =
-      path.dirname(guestAssets.kernelPath) ===
-        path.dirname(guestAssets.initrdPath) &&
-      path.dirname(guestAssets.kernelPath) ===
-        path.dirname(guestAssets.rootfsPath)
-        ? path.dirname(guestAssets.kernelPath)
-        : null;
-
-    const manifest = commonDir ? loadAssetManifest(commonDir) : null;
-    const guestAssetBuildId = manifest?.buildId;
-
+    const guestAssetBuildId = localManifest?.buildId ?? exported.buildId;
     if (!guestAssetBuildId) {
+      fs.rmSync(partial, { force: true });
       throw new Error(
-        "cannot checkpoint: guest assets are missing manifest buildId (rebuild guest assets with a newer gondolin build)",
+        "cannot checkpoint: the daemon's guest image has no manifest buildId",
       );
     }
+    fs.rmSync(resolvedCheckpointPath, { force: true });
+    fs.renameSync(partial, resolvedCheckpointPath);
 
     const createdWithVmm = this.resolvedSandboxOptions.vmm;
+    const hasKrunKernel = this.remote
+      ? Boolean(server.getResolvedImage()?.krun_kernel)
+      : Boolean(localManifest?.assets?.krunKernel);
     const compatibleVmm: SandboxVmm[] =
-      manifest?.assets?.krunKernel || createdWithVmm === "krun"
-        ? ["qemu", "krun"]
-        : ["qemu"];
-
+      hasKrunKernel || createdWithVmm === "krun" ? ["qemu", "krun"] : ["qemu"];
     const data: VmCheckpointData = {
       version: 1,
-      name: checkpointName,
+      name: path.basename(
+        resolvedCheckpointPath,
+        path.extname(resolvedCheckpointPath),
+      ),
       createdAt: new Date().toISOString(),
       // Kept for schema compatibility (ignored for single-file checkpoints)
       diskFile: path.basename(resolvedCheckpointPath),
@@ -2055,13 +2296,10 @@ fi
       createdWithVmm,
       compatibleVmm,
     };
-
     VmCheckpoint.writeTrailer(resolvedCheckpointPath, data);
 
     // Mark this VM as consumed.
-    this.rootDisk = null;
     this.checkpointed = true;
-
     return new VmCheckpoint(
       resolvedCheckpointPath,
       data,
@@ -2079,20 +2317,15 @@ fi
 
 registerVmCreate((options) => VM.create(options));
 
-function installRootDisk(
-  resolved: ResolvedSandboxServerOptions,
-  rootDisk: RootDiskState,
-): RootDiskState {
-  resolved.rootDiskPath = rootDisk.path;
-  resolved.rootDiskFormat = rootDisk.format;
-  resolved.rootDiskReadOnly = rootDisk.readOnly;
-  return rootDisk;
-}
-
-function prepareConfiguredRootDisk(
+/**
+ * The controller's own root disk (`sandbox.rootDisk*`): attached as is, the
+ * daemon only grows it for `rootfs.size`.
+ */
+function configuredRootDisk(
   resolved: ResolvedSandboxServerOptions,
   options: SandboxServerOptions,
-): RootDiskState {
+  size: number | undefined,
+): NativeRootDisk {
   const rootDiskPath = options.rootDiskPath ?? resolved.rootDiskPath;
   const deleteOnClose = options.rootDiskDeleteOnClose ?? false;
 
@@ -2105,46 +2338,29 @@ function prepareConfiguredRootDisk(
       "sandbox.rootDiskDeleteOnClose requires sandbox.rootDiskPath (refusing to delete base rootfs)",
     );
   }
-
-  return installRootDisk(resolved, {
+  const readOnly =
+    options.rootDiskReadOnly ?? resolved.rootDiskReadOnly ?? false;
+  if (size !== undefined) {
+    if (readOnly) {
+      throw new Error(
+        "rootfs.size requires a writable root disk (rootfs.mode cannot be readonly)",
+      );
+    }
+    if (isSameExistingFile(rootDiskPath, resolved.rootfsPath)) {
+      throw new Error(
+        "rootfs.size refuses to resize the base rootfs image; use rootfs.mode='cow' or provide a separate sandbox.rootDiskPath",
+      );
+    }
+  }
+  return {
     path: rootDiskPath,
     format:
       options.rootDiskFormat ??
       resolved.rootDiskFormat ??
       inferDiskFormatFromPath(rootDiskPath),
-    snapshot: false,
-    readOnly: options.rootDiskReadOnly ?? resolved.rootDiskReadOnly ?? false,
-    deleteOnClose,
-  });
-}
-
-function prepareBaseRootDisk(
-  resolved: ResolvedSandboxServerOptions,
-  opts: Pick<RootDiskState, "readOnly" | "snapshot">,
-): RootDiskState {
-  return installRootDisk(resolved, {
-    path: resolved.rootfsPath,
-    format: inferDiskFormatFromPath(resolved.rootfsPath),
-    snapshot: opts.snapshot,
-    readOnly: opts.readOnly,
-    deleteOnClose: false,
-  });
-}
-
-function prepareOverlayRootDisk(
-  resolved: ResolvedSandboxServerOptions,
-): RootDiskState {
-  ensureQemuImgAvailable();
-  return installRootDisk(resolved, {
-    path: createTempQcow2Overlay(
-      resolved.rootfsPath,
-      inferDiskFormatFromPath(resolved.rootfsPath),
-    ),
-    format: "qcow2",
-    snapshot: false,
-    readOnly: false,
-    deleteOnClose: true,
-  });
+    readOnly,
+    size,
+  };
 }
 
 function isSameExistingFile(a: string, b: string): boolean {
@@ -2159,29 +2375,6 @@ function isSameExistingFile(a: string, b: string): boolean {
   } catch {
     return false;
   }
-}
-
-function prepareRootDiskResize(
-  rootDisk: RootDiskState | null,
-  rootfsPath: string,
-  sizeBytes: number,
-): void {
-  if (!rootDisk) {
-    throw new Error("rootfs.size requires a root disk");
-  }
-  if (rootDisk.readOnly) {
-    throw new Error(
-      "rootfs.size requires a writable root disk (rootfs.mode cannot be readonly)",
-    );
-  }
-  if (isSameExistingFile(rootDisk.path, rootfsPath)) {
-    throw new Error(
-      "rootfs.size refuses to resize the base rootfs image; use rootfs.mode='cow' or provide a separate sandbox.rootDiskPath",
-    );
-  }
-
-  ensureQemuImgAvailable();
-  ensureDiskImageMinimumSize(rootDisk.path, sizeBytes);
 }
 
 function resolveManifestRootfsMode(

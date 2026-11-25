@@ -7,7 +7,6 @@
     "kernelImage": "vmlinuz-virt",
     "rootfsPackages": [
       "linux-virt",
-      "rng-tools",
       "bash",
       "ca-certificates",
       "curl",
@@ -15,7 +14,6 @@
       "npm",
       "python3",
       "qemu-system-aarch64",
-      "qemu-img",
       "docker",
       "docker-cli",
       "containerd",

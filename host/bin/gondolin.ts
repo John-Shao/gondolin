@@ -11,13 +11,22 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { VmCheckpoint } from "../src/checkpoint.ts";
 import { gondolinCacheDir } from "../src/cache.ts";
-import { parseDiskSizeToBytes } from "../src/qemu/img.ts";
+import { parseDiskSizeToBytes } from "../src/vm/disk.ts";
 import { VM } from "../src/vm/core.ts";
+import {
+  nativeDaemonCommand,
+  resolveNativeBinary,
+} from "../src/native/binary.ts";
 import type { VirtualProvider } from "../src/vfs/node/index.ts";
-import { MemoryProvider, RealFSProvider } from "../src/vfs/node/index.ts";
+import { RealFSProvider } from "../src/vfs/node/index.ts";
+import { nativeMounts } from "../src/native/vfs.ts";
 import { ReadonlyProvider } from "../src/vfs/readonly.ts";
 import { createHttpHooks } from "../src/http/hooks.ts";
-import type { HttpHooks } from "../src/qemu/contracts.ts";
+import {
+  createDjsHooks,
+  djsHooksOptionsFromFile,
+} from "../src/http/djs-hooks.ts";
+import type { HttpHooks } from "../src/net/types.ts";
 import { suggestHostsForSecret } from "../src/secret-host-suggestions.ts";
 import {
   ensureTrufflehogBinary,
@@ -194,8 +203,12 @@ function renderCliError(err: unknown) {
       if (process.platform === "darwin") {
         console.error("  brew install qemu");
       } else {
+        // Debian/Ubuntu package the aarch64 and x86_64 emulators separately
+        const pkg = binary.includes("x86_64")
+          ? "qemu-system-x86"
+          : "qemu-system-arm";
         console.error(
-          "  sudo apt install qemu-system (or equivalent for your distro)",
+          `  sudo apt install ${pkg} (Debian/Ubuntu, or equivalent for your distro)`,
         );
       }
       return;
@@ -215,7 +228,7 @@ function renderCliError(err: unknown) {
 }
 
 function usage() {
-  console.log("Usage: gondolin <command> [options]");
+  console.log("Usage: gondolin [engine options] <command> [options]");
   console.log("Commands:");
   console.log(
     "  exec         Run a command via a session IPC socket or in-process VM",
@@ -232,6 +245,19 @@ function usage() {
   console.log("  image        Manage local image refs and objects");
   console.log("  tools        Inspect/download managed helper tools");
   console.log("  help         Show this help");
+  console.log(
+    "  version      Print the package version and the gondolind it would use (also --version)",
+  );
+  console.log("\nEngine options (before the command):");
+  console.log(
+    "  --engine native|auto     Host engine; both select the native engine (gondolind), kept for compatibility",
+  );
+  console.log(
+    "  --native-command CMD     Start gondolind with CMD (e.g. 'ssh host gondolind')",
+  );
+  console.log(
+    "  --remote                 gondolind runs on another machine (no shared files)",
+  );
   console.log("\nRun gondolin <command> --help for command-specific flags.");
 }
 
@@ -260,7 +286,7 @@ function bashUsage() {
     "  --image IMAGE                   Guest image selector (asset dir, build id, or name:tag)",
   );
   console.log(
-    "  --vmm BACKEND                   VM backend: qemu|krun (default: qemu)",
+    "  --vmm BACKEND                   VM backend: qemu|krun (default: krun when usable, else qemu)",
   );
   console.log(
     "  --rootfs-size SIZE              Ensure rootfs virtual disk is at least SIZE",
@@ -280,6 +306,9 @@ function bashUsage() {
   console.log("Network Options:");
   console.log(
     "  --allow-host HOST               Allow HTTP requests to host (can repeat)",
+  );
+  console.log(
+    "  --hooks-script FILE             Tier-2 hook policy (.js script, .mjs module, .ts TypeScript)",
   );
   console.log("  --host-secret NAME[=VALUE] | NAME@HOST[,HOST...][=VALUE]");
   console.log(
@@ -321,6 +350,9 @@ function bashUsage() {
   console.log(
     "  --disable-websockets            Disable WebSocket upgrades (egress + ingress)",
   );
+  console.log(
+    "  --print-configure               Print the native engine's session configuration (JSON) and exit",
+  );
   console.log();
   console.log("Ingress:");
   console.log(
@@ -346,7 +378,7 @@ function bashUsage() {
   );
   console.log("  gondolin bash --allow-host api.github.com");
   console.log("  gondolin bash --host-secret GITHUB_TOKEN@api.github.com");
-  console.log("  gondolin bash --cmd claude --cwd /workspace");
+  console.log("  gondolin bash --cwd /workspace -- claude");
   console.log("  gondolin bash --listen");
   console.log("  gondolin bash --listen 127.0.0.1:3000");
   console.log("  gondolin bash --resume 4a8f2b0c");
@@ -423,7 +455,7 @@ function execUsage() {
     "  --image IMAGE                   Guest image selector (asset dir, build id, or name:tag)",
   );
   console.log(
-    "  --vmm BACKEND                   VM backend: qemu|krun (default: qemu)",
+    "  --vmm BACKEND                   VM backend: qemu|krun (default: krun when usable, else qemu)",
   );
   console.log(
     "  --rootfs-size SIZE              Ensure rootfs virtual disk is at least SIZE",
@@ -431,6 +463,9 @@ function execUsage() {
   console.log();
   console.log("Network Options (VM mode only):");
   console.log("  --allow-host HOST               Allow HTTP requests to host");
+  console.log(
+    "  --hooks-script FILE             Tier-2 hook policy (.js script, .mjs module, .ts TypeScript)",
+  );
   console.log("  --host-secret NAME[=VALUE] | NAME@HOST[,HOST...][=VALUE]");
   console.log(
     "                                  Add secret with explicit hosts or discover suggestions",
@@ -468,6 +503,9 @@ function execUsage() {
   console.log(
     "  --disable-websockets            Disable WebSocket upgrades (egress + ingress)",
   );
+  console.log(
+    "  --print-configure               Print the native engine's session configuration (JSON) and exit",
+  );
 }
 
 type MountSpec = {
@@ -495,6 +533,9 @@ type CommonOptions = {
   memoryMounts: string[];
   allowedHosts: string[];
   secrets: SecretSpec[];
+
+  /** tier-2 hook policy file (`createDjsHooks`) */
+  hooksScript?: string;
 
   /** image selector (asset dir, build id, or name:tag) */
   image?: string;
@@ -531,6 +572,9 @@ type CommonOptions = {
 
   /** ssh credentials for host-side proxy auth */
   sshCredentials: SshCredentialSpec[];
+
+  /** print the native engine's configure payload instead of starting a VM */
+  printConfigure?: boolean;
 
   /** enable ssh (bash command only) */
   ssh?: boolean;
@@ -937,6 +981,11 @@ function parseListenSpec(spec: string): { host: string; port: number } {
   return { host, port };
 }
 
+/** `--hooks-script FILE`: a tier-2 policy (`.mjs` module, `.ts`/`.mts` TypeScript), with its relative imports */
+function loadHooksScript(file: string): HttpHooks {
+  return createDjsHooks(djsHooksOptionsFromFile(file));
+}
+
 function buildVmOptions(common: CommonOptions) {
   const mounts: Record<string, VirtualProvider> = {};
 
@@ -961,13 +1010,17 @@ function buildVmOptions(common: CommonOptions) {
 
   // Add memory mounts
   for (const path of common.memoryMounts) {
-    mounts[path] = new MemoryProvider();
+    // a daemon-side memory filesystem on the native engine
+    mounts[path] = nativeMounts.memory();
   }
 
   // Build HTTP hooks if we have network options
   let httpHooks: HttpHooks | undefined;
   let env: Record<string, string> | undefined;
 
+  const djsHooks = common.hooksScript
+    ? loadHooksScript(common.hooksScript)
+    : undefined;
   if (common.allowedHosts.length > 0 || common.secrets.length > 0) {
     const secrets: Record<string, { hosts: string[]; value: string }> = {};
     for (const secret of common.secrets) {
@@ -978,9 +1031,12 @@ function buildVmOptions(common: CommonOptions) {
       allowedHosts:
         common.allowedHosts.length > 0 ? common.allowedHosts : undefined,
       secrets,
+      ...djsHooks,
     });
     httpHooks = result.httpHooks;
     env = result.env;
+  } else if (djsHooks) {
+    httpHooks = djsHooks;
   }
 
   if (common.dnsTrustedServers.length > 0) {
@@ -1197,10 +1253,20 @@ function parseExecArgs(argv: string[]): ExecArgs {
         args.common.rootfsSize = parseRootfsSizeOption(optionArgs[++i], fail);
         return i;
       }
+      case "--print-configure": {
+        args.common.printConfigure = true;
+        return i;
+      }
       case "--allow-host": {
         const host = optionArgs[++i];
         if (!host) fail("--allow-host requires a host argument");
         args.common.allowedHosts.push(host);
+        return i;
+      }
+      case "--hooks-script": {
+        const file = optionArgs[++i];
+        if (!file) fail("--hooks-script requires a file argument");
+        args.common.hooksScript = file;
         return i;
       }
       case "--host-secret": {
@@ -1404,8 +1470,68 @@ function buildCommandPayload(command: Command) {
   return payload;
 }
 
+/**
+ * Print the native engine's `configure` payload and default guest env for
+ * the given VM options without starting a VM (`--print-configure`; the
+ * static native CLI prints the same, see `test/cli-configure-parity.test.ts`).
+ * Byte strings are printed as `{ "$base64": "..." }`; the MITM CA key and
+ * secret values as `"<redacted>"`.
+ */
+async function printNativeConfigure(
+  vmOptions: Record<string, unknown>,
+  resume?: string,
+) {
+  let vm: VM | null = null;
+  try {
+    if (resume) {
+      const checkpoint = VmCheckpoint.load(resolveResumeCheckpoint(resume));
+      vm = (await checkpoint.resume({
+        ...vmOptions,
+        engine: "native",
+        autoStart: false,
+      } as any)) as VM;
+    } else {
+      vm = await VM.create({ ...vmOptions, engine: "native" });
+    }
+    const described = await vm.describeNativeConfigure();
+    const text = `${JSON.stringify(
+      described,
+      function (this: any, key: string, value: unknown) {
+        const raw = this[key];
+        // secrets: the MITM CA key and secret values
+        if (
+          (key === "key_pem" || key === "value" || key === "revoked_values") &&
+          raw !== undefined
+        ) {
+          return "<redacted>";
+        }
+        if (raw instanceof Uint8Array) {
+          return { $base64: Buffer.from(raw).toString("base64") };
+        }
+        return value;
+      },
+      2,
+    )}\n`;
+    // flushed before the caller exits (pipes are asynchronous)
+    await new Promise<void>((resolve) =>
+      process.stdout.write(text, () => resolve()),
+    );
+  } finally {
+    await vm?.close();
+  }
+}
+
 async function runExecVm(args: ExecArgs) {
   const vmOptions = buildVmOptions(args.common);
+  if (args.common.printConfigure) {
+    try {
+      await printNativeConfigure(vmOptions);
+    } catch (err) {
+      renderCliError(err);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
   let vm: VM | null = null;
   let exitCode = 0;
 
@@ -1565,7 +1691,7 @@ async function resolveExecSocketPath(value: string): Promise<string> {
 async function runExec(argv: string[] = process.argv.slice(2)) {
   const args = parseExecArgs(argv);
 
-  if (args.commands.length === 0) {
+  if (args.commands.length === 0 && !args.common.printConfigure) {
     execUsage();
     process.exit(1);
   }
@@ -1697,6 +1823,10 @@ function parseBashArgs(argv: string[]): BashArgs {
         args.rootfsSize = parseRootfsSizeOption(argv[++i], fail);
         break;
       }
+      case "--print-configure": {
+        args.printConfigure = true;
+        break;
+      }
       case "--allow-host": {
         const host = argv[++i];
         if (!host) {
@@ -1704,6 +1834,15 @@ function parseBashArgs(argv: string[]): BashArgs {
           process.exit(1);
         }
         args.allowedHosts.push(host);
+        break;
+      }
+      case "--hooks-script": {
+        const file = argv[++i];
+        if (!file) {
+          console.error("--hooks-script requires a file argument");
+          process.exit(1);
+        }
+        args.hooksScript = file;
         break;
       }
       case "--host-secret": {
@@ -1905,6 +2044,15 @@ async function runBash(argv: string[]) {
   const args = parseBashArgs(argv);
   args.secrets = await resolveSecretHosts(args.secrets);
   const vmOptions = buildVmOptions(args);
+  if (args.printConfigure) {
+    try {
+      await printNativeConfigure(vmOptions, args.resume);
+    } catch (err) {
+      renderCliError(err);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
   let vm: VM | null = null;
   let ingressAccess: { url: string; close(): Promise<void> } | null = null;
   let exitCode = 1;
@@ -3401,8 +3549,87 @@ async function runImage(argv: string[]) {
   }
 }
 
+/**
+ * Global engine flags (before the command): `--engine native|auto`,
+ * `--native-command CMD`, `--remote`. They are applied through the
+ * environment (`GONDOLIN_ENGINE`, `GONDOLIN_NATIVE_COMMAND`,
+ * `GONDOLIN_NATIVE_REMOTE`) so every VM the command creates (including
+ * checkpoint resumes) uses them.
+ */
+function applyGlobalEngineFlags(argv: string[]): string[] {
+  const rest = [...argv];
+  const fail = (message: string): never => {
+    console.error(message);
+    usage();
+    process.exit(1);
+  };
+  while (rest.length > 0 && rest[0]!.startsWith("--")) {
+    const arg = rest[0]!;
+    const [name, inline] = arg.includes("=")
+      ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)]
+      : [arg, undefined];
+    const takeValue = (): string => {
+      if (inline !== undefined) return inline;
+      const value = rest[1];
+      if (value === undefined || value.startsWith("--")) {
+        fail(`${name} requires an argument`);
+      }
+      rest.shift();
+      return value!;
+    };
+    if (name === "--engine") {
+      const engine = takeValue().trim().toLowerCase();
+      if (engine === "node") {
+        fail(
+          "--engine node: the node engine has been removed; Gondolin always uses the native engine",
+        );
+      }
+      if (engine !== "native" && engine !== "auto") {
+        fail(`invalid --engine: ${engine} (expected native or auto)`);
+      }
+      process.env.GONDOLIN_ENGINE = engine;
+    } else if (name === "--native-command") {
+      process.env.GONDOLIN_NATIVE_COMMAND = takeValue();
+    } else if (name === "--remote") {
+      process.env.GONDOLIN_NATIVE_REMOTE = "1";
+    } else {
+      break;
+    }
+    rest.shift();
+  }
+  return rest;
+}
+
+/** `gondolin --version`: package version plus the gondolind it resolves. */
+function runVersion() {
+  let version = "unknown";
+  let dir = import.meta.dirname;
+  for (let i = 0; i < 6; i++) {
+    const pkgPath = path.join(dir, "package.json");
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
+        name?: string;
+        version?: string;
+      };
+      if (pkg.name === "@earendil-works/gondolin" && pkg.version) {
+        version = pkg.version;
+        break;
+      }
+    }
+    dir = path.dirname(dir);
+  }
+  console.log(`gondolin ${version}`);
+  let native: string;
+  try {
+    native = nativeDaemonCommand(resolveNativeBinary()).join(" ");
+  } catch (err) {
+    native = `not available (${err instanceof Error ? err.message : String(err)})`;
+  }
+  console.log(`gondolind: ${native}`);
+}
+
 async function main() {
-  const [command, ...args] = process.argv.slice(2);
+  const [command, ...args] = applyGlobalEngineFlags(process.argv.slice(2));
 
   if (
     !command ||
@@ -3415,6 +3642,11 @@ async function main() {
   }
 
   switch (command) {
+    case "version":
+    case "--version":
+    case "-V":
+      runVersion();
+      return;
     case "exec":
       await runExec(args);
       return;
